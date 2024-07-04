@@ -1,0 +1,319 @@
+/**************************************************
+Description:	
+Developed by:		SYSADM
+Completion Date:
+Parameter 1:		- GROUPCODE: sample group template code,
+					- SP_CODE: sp_code of the sample to be created,
+					- SUPPCODE: supplier code,
+					- sBatchNo:  internal batch number,
+					- MFGDATE: manufacturing date (optional),
+					- RECEIVEDATE: receiving date, 
+					- strMetadataGUID:  metadata GUID, 
+					- nRawMatQty: Estimated volume of the batch, 
+					- sQtyUnits: estimated volume units of the batch, 
+					- sBatchDesc: batch description, 
+					- nInventoryCount: for ANSI sampling the total count of inventories, 
+					- sSuppBatchNo: supplier batch number (optional)
+					- dtExpirationDate:  batch expiration date (optional)
+					- nInventoryId
+					- strPlant: batch plant
+					- strMode: null or "INVENTORY"
+					- arrInventoryItems: array of inventory id's when the opening mode is "INVENTORY"
+					- bSamplingRequirementsBasedOnSampleDefinition
+					- bCreateSampleForEachInventory
+					- sClient: client for invoicing (optional)
+					- sProject: project for invoicing (optional)
+
+Return:				-1: when the sample does not have a material code
+					-99: when the internal batch number exists
+___________________________________________________
+
+Ticket #..... : 	1324098 - Process Templates
+Modifications : 	- added units for qty
+					- Received date is mandatory instead of 
+						manufacturing date
+					- Receive date is the OPENDATE of the BATCHES
+					- Added description to batch
+					- Populate Sampling Requirements with and Inventory Id 
+						for each container Batch Sampling Requirements
+Author....... :		FT
+Date......... :		2008-05-02
+___________________________________________________
+
+Ticket #..... : 	
+Modifications : 	ANSI Sampling
+Author....... :		FT
+Date......... :		2008-07-17
+___________________________________________________
+Ticket #..... : 	
+Modifications : 	Put default values to 
+					inventory count and 
+					sSuppBatchNo
+Author....... :		MR
+Date......... :		2008-07-28
+___________________________________________________
+Ticket #..... : 	
+Modifications : 	Pass Parent InventoryId as a parameter
+Author....... :		EMILIAI
+Date......... :		2008-11-25
+___________________________________________________
+Ticket #..... : Z00000615B0004 - Need ability to configure the Sample#
+Modification. : implemented new mechanism for generating ORDNO
+Author....... :	MOP
+Date......... :	2011-02-01
+_______________________________________________________________________________
+Ticket #..... : Z00000332B3031 - Planned Event Workflow Triggers - not working
+Modification. : add the planned triggers to the log table
+Author....... :	MOP
+Date......... :	2011-03-25
+_______________________________________________________________________________
+Ticket #..... : Z00000332B3869 Remove 70 occurrences of LIMSDate from our 
+					development environment
+Modification. : - Removed LimsDate
+Author....... :	Fabiola Tang
+Date......... : 2011-11-15
+_______________________________________________________________________________
+**************************************************/;
+ 
+
+:PARAMETERS GROUPCODE, SP_CODE, SUPPCODE, sBatchNo, MFGDATE, RECEIVEDATE, strMetadataGUID, nRawMatQty, sQtyUnits, sBatchDesc, 
+			nInventoryCount, sSuppBatchNo, dtExpirationDate, nInventoryId, strPlant, strMode, arrInventoryItems, bSamplingRequirementsBasedOnSampleDefinition, bCreateSampleForEachInventory,
+			sClient, sProject, nSpecNo, nInspectionLotNo, nSupllierName, sNameOfManufacturer, nContainer, Retest_Date, nGRN, QCArno, nChemicalName, IL_MatCode, nShelfLife, nCustomerPOno;
+			
+										
+:DEFAULT strMetadataGUID, "";
+:DEFAULT nRawMatQty, 0;
+:DEFAULT sQtyUnits, "";
+:DEFAULT sBatchDesc, "";
+:DEFAULT nInventoryCount, 0;
+:DEFAULT sSuppBatchNo, "";
+:DEFAULT nSpecNo, -1;
+:DEFAULT IL_MatCode, "N/A";
+:IF ExecFunction("BatchManager.hasTestsWithoutMethods", {GROUPCODE, NIL, {SP_CODE}});
+	:RETURN {.F., "", -80};
+:ENDIF;
+
+:IF ExecFunction("GenericSettings.GetValue", {"/Login Options/Create Batch/AutoBATCHNO", .F.});
+	sBatchNo := ExecFunction("BatchManager.CALC_NEXT_BATCHNO", {STARLIMSSITECODE, GROUPCODE, strPlant});
+:ENDIF;
+
+:DECLARE arrInsertValues;
+arrInsertValues := {};
+
+:DECLARE BATCHID,BatchExists,FolderExists,PROFILE,SAMPDESC, nSampleVersion, bAutoStartBatch, bRequiresInspection,
+		noOfSamples, FOLDERNO,sMatCode;
+
+PROFILE:="Default";
+
+
+MATCODE := SqlExecute("Select ipd.MATCODE, sp.VERSION, ipd.NO_SAMPLES_TO_LOGIN 
+						from SAMPLE_PROGRAMS sp 
+						join IPSAMPLEGROUPDETAILS ipd on sp.SP_CODE = ipd.SP_CODE
+						where ipd.SAMPLEGROUPCODE = ?GROUPCODE?
+						and ipd.SP_CODE=?SP_CODE?");
+:IF Len(MATCODE)=0;
+    :RETURN {.F., "", -1};
+:ELSE;
+	nSampleVersion := MATCODE[1, 2];
+    noOfSamples := MATCODE[1, 3];
+	MATCODE := MATCODE[1, 1];
+:ENDIF;	
+
+:DECLARE strMetadataTemplate;
+
+PRODGROUP:=SqlExecute("Select PRODGROUP, METADATA_TEMPLATE, AUTOSTARTBATCH, ANSI_INSPECTION
+						from IPSAMPLEGRPOUPS 
+						where SAMPLEGROUPCODE=?GROUPCODE?");
+						
+strMetadataTemplate := PRODGROUP[1, 2];
+bAutoStartBatch := (PRODGROUP[1, 3] == "Y");
+bRequiresInspection  := (PRODGROUP[1, 4] == "Y");
+PRODGROUP:=PRODGROUP[1,1];
+
+
+BatchExists:=SqlExecute("Select BATCHID from BATCHES where BATCHNO=?sBatchNo? and SUPPCODE=?SUPPCODE? and MATCODE=?MATCODE? and 1=0");
+
+:IF Len(BatchExists)=0;
+	:IF Empty(strMetadataGUID) .AND. .NOT. Empty(strMetadataTemplate);
+		strMetadataGUID := ExecFunction("GenericMetadata.CreateMetadata", 
+													{strMetadataTemplate});
+	:ENDIF;
+
+   	BATCHID:= LIMSSetCounter("MRPBATCHES","MRPREQNO","",{"No Insert"},{});
+
+	/*For SAP - start;
+	:DECLARE aDeptList;
+	:IF Empty(STARLIMSDEPT);
+		aDeptList := SqlExecute("Select DEPTLIST from USERS where USRNAM = '" + GetUserData() + "'" );
+		aDeptList:= BuildArray(aDeptList[1,1]);
+		STARLIMSDEPT := aDeptList[1];
+	:ENDIF;
+   	/*For SAP - end;
+	
+	:IF Empty(MFGDATE);
+		AAdd(arrInsertValues, "NULL");
+	:ELSE;
+		AAdd(arrInsertValues, "?MFGDATE?");
+	:ENDIF;
+	
+	:IF Empty(dtExpirationDate);
+		AAdd(arrInsertValues, "NULL");
+	:ELSE;
+		AAdd(arrInsertValues, "?dtExpirationDate?");
+	:ENDIF;
+	
+		SqlExecute("Insert Into BATCHES (BATCHID,PARENTBATCHID,SUPPCODE,MATCODE,BATCHNO,
+									OPENDATE, BATCHSTATUS,DISPSTS,TYPE,DEPT,SAMPLEGROUPCODE,PRODGROUP,
+										METADATA_GUID, ESTIMATEDVOL, ESTIMATEDVOL_UNITS, BATCHNAME, SUPPBATCHNO, CUSTOMER_PO_NUMBER,
+										PLANT, RASCLIENTID, RASPROJECTNO, INSPECTION_LOTNO,SUPPLIER_NAME, MANUFACTURER_NAME,VESSEL,RETEST_DATE,GRN,CATNO,BATCHDESCRIPTION,CHEMICAL_NAME,SHELF_LIFE,
+										ENDDATE, EXPDATE)
+				Values (?BATCHID?, ?BATCHID?, ?SUPPCODE?, ?MATCODE?, ?sBatchNo?,
+						?RECEIVEDATE?, ?Planned?, ?Planned?,'RAW',?STARLIMSDEPT?,?GROUPCODE?,?PRODGROUP?,
+						?strMetadataGUID?, ?nRawMatQty?, ?sQtyUnits?, ?sBatchDesc?, ?sSuppBatchNo?, ?nCustomerPOno?, 
+						?strPlant?, ?sClient?, ?sProject?, ?nInspectionLotNo?, ?nSupllierName?, ?sNameOfManufacturer?, ?nContainer?, ?Retest_Date?, ?nGRN?, ?QCArno?, ?sBatchDesc?,?nChemicalName?,?nShelfLife?,
+						" + BuildString(arrInsertValues) + ")");
+
+
+:ELSE;
+   :RETURN {.F., "", -99};
+:ENDIF;	
+
+/* calculate ANSI Sample Size;
+:IF bRequiresInspection;
+	Execfunction("BatchManager.calculateANSIData",{BATCHID,nRawMatQty,MATCODE, .T., .F.});
+:ENDIF;
+			
+
+SPCODELIST:=SqlExecute("Select SP_CODE,PROFILE from IPSAMPLEGROUPDETAILS where SP_CODE = ?SP_CODE?  and 
+          SAMPLEGROUPCODE=?GROUPCODE?");
+
+PROFILE:=SPCODELIST[1,2];
+
+/* Determine Skip lot testing PROFILE; 
+:DECLARE sSkipLotProfile;
+sSkipLotProfile := Execfunction("BatchManager.getSkipLotTestingProfile",{GROUPCODE, SP_CODE, SUPPCODE, sBatchNo, sSuppBatchNo});
+
+:IF sSkipLotProfile <> "";
+	PROFILE := sSkipLotProfile;
+:ENDIF;
+			
+FolderExists:=SqlExecute("Select FOLDERNO from FOLDERS where  	BATCHID=?BATCHID?");
+
+:IF Len(FolderExists)=0;
+	:DECLARE oGenerateORDNOContext, j, i, ORDNO, aORDNOs, iORDNO;
+	oGenerateORDNOContext := CreateUDObject("SAMPLELOGIN_GENERAL.GenerateORDNOContext");
+	oGenerateORDNOContext:sLoginType := "Manufacturing";
+	oGenerateORDNOContext:sSite := STARLIMSDEPT;
+	oGenerateORDNOContext:nCount := noOfSamples - 1;
+	iORDNO := 1;		
+	:FOR j := 1 :TO noOfSamples;
+		:IF Empty(FOLDERNO);
+			FOLDERNO:=ExecFunction("SAMPLELOGIN_GENERAL.LOGINBYSPCODE",{SP_CODE,PROFILE, , , , , "Manufacturing", oGenerateORDNOContext:sSite, NIL, NIL, NIL, sClient, sProject});
+			FOLDERNO:=FOLDERNO[2];
+		:ELSE;
+			:IF Empty(aORDNOs);
+				oGenerateORDNOContext:sFOLDERNO := FOLDERNO;
+				aORDNOs := ExecFunction("SAMPLELOGIN_GENERAL.generateORDNOs", {oGenerateORDNOContext});
+				:IF Empty(aORDNOs) .OR. Len(aORDNOs) != oGenerateORDNOContext:nCount;
+					RaiseError("ORDNO generation failed - please check ORDNO generation calculation");
+				:ENDIF;
+			:ENDIF;	
+			ORDNO := aORDNOs[iORDNO];
+			iORDNO += 1;
+			ExecFunction("SAMPLELOGIN_GENERAL.LOGINBYSPCODE",
+						{SP_CODE,PROFILE,FOLDERNO,"MULTISPCODES", , ORDNO, "Manufacturing", oGenerateORDNOContext:sSite, NIL, NIL, NIL, sClient, sProject});
+		:ENDIF;
+	:NEXT;
+	
+	
+:ELSE;
+    FOLDERNO:= FolderExists[1,1];
+   	Dummy:=ExecFunction("SAMPLELOGIN_GENERAL.LOGINBYSPCODE",
+							{SP_CODE,{{PROFILE},{}},FOLDERNO,"MULTISPCODES", , , "Manufacturing", 
+							 NIL, NIL, NIL, NIL, sClient, sProject});
+:ENDIF;
+
+:IF EMPTY(IL_MatCode);
+	IL_MatCode := sMatCode;
+:ENDIF;
+SqlExecute("Update FOLDERS set BATCHID=?BATCHID?,BATCHNO=?sBatchNo?,IL_MATCODE=?IL_MatCode? where FOLDERNO=?FOLDERNO?");
+/* New specification process;
+SqlExecute("Update ORDERS 
+			set SAMPLEGROUPCODE=?GROUPCODE?,
+				SPECCATEGORY=(Select SPECCATEGORY 
+							  from SPEC_SETS 
+							  where SPECNO = ?nSpecNo?),
+				SPECNO = ?nSpecNo?
+			where FOLDERNO=?FOLDERNO?   ");
+
+SAMPDESC:="RM: "+MATCODE + " v " + LimsString(nSampleVersion) + " Supplier: "+SUPPCODE+" Batch#: "+sBatchNo ;
+LastOrdno:= SqlExecute("Select Max(ORDNO) from ORDERS where FOLDERNO=?FOLDERNO?");
+
+
+:IF .not. Empty(LastOrdno[1,1]);
+    LastOrdno:=LastOrdno[1,1];
+	:IF Empty(RECEIVEDATE);
+	    SqlExecute("Update ORDERS set CLSAMPNO=?SAMPDESC?,SAMPLEGROUPCODE=?GROUPCODE? where ORDNO=?LastOrdno?");
+	
+	:ELSE;
+	    SqlExecute("Update ORDERS set CLSAMPNO=?SAMPDESC?,SAMPLEGROUPCODE=?GROUPCODE?,SAMPDATE=?RECEIVEDATE? where ORDNO=?LastOrdno?");
+	:ENDIF;	
+:ENDIF;
+
+SqlExecute("Update FOLDERS set BATCHID=?BATCHID?,BATCHNO=?sBatchNo? where FOLDERNO=?FOLDERNO?");
+SqlExecute("Update ORDERS set BATNO = ?sBatchNo?,SAMPLENAME = ?PROFILE? where FOLDERNO = ?FOLDERNO?");
+
+SqlExecute("Update ORDERS set IPTRIGGERTEMPLATECODE=(Select  Max(IPTRIGGERTEMPLATECODE)
+		       from IPSAMPLEGROUPDETAILS,IPTRIGGERTEMPLATES
+			   where IPSAMPLEGROUPDETAILS.IPTRIGGERTEMPLATENAME=IPTRIGGERTEMPLATES.IPTRIGGERTEMPLATENAME and 
+			         IPSAMPLEGROUPDETAILS.SAMPLEGROUPCODE=ORDERS.SAMPLEGROUPCODE and 
+					 IPSAMPLEGROUPDETAILS.SP_CODE=ORDERS.SP_CODE  and 
+					  IPTRIGGERTEMPLATES.STARTDDATE<={fn Now()} and IPTRIGGERTEMPLATES.EXPDATE>={fn Now()} ) where  FOLDERNO=?FOLDERNO?   ");
+
+ExecFunction("BatchManager.CopySamplesForEachInventory", 
+				{BATCHID, strMode, arrInventoryItems, 
+					bSamplingRequirementsBasedOnSampleDefinition, 
+					bCreateSampleForEachInventory});
+/*Adding AR No.;
+	:IF PRODGROUP == "Packaging materials";	
+		ExecFunction("SAMPLELOGIN_GENERAL.CALC_AR_NO",{FOLDERNO,PRODGROUP,sBatchNo,"PM"});
+	:ELSE;			
+		ExecFunction("SAMPLELOGIN_GENERAL.CALC_AR_NO",{FOLDERNO,"Raw materials",sBatchNo,"RM"});
+	:ENDIF;
+
+ExecFunction("SAMPLELOGIN_GENERAL.COMMITFOLDER",{ FOLDERNO,"PRELOG"});
+
+/*Populate Sampling Requirements with and Inventory Id for each container
+nInventoryId is the parent InventoryId to be split;
+ExecFunction("BatchManager.createSamplingRequirements", 
+				{GROUPCODE, BATCHID, nInventoryId, strMode, arrInventoryItems, 
+					bSamplingRequirementsBasedOnSampleDefinition, bCreateSampleForEachInventory,
+					{{SP_CODE, PROFILE}}
+				});
+
+SqlExecute("Update ORDERS set   DISPSTS=?Planned?,STATUS =?Planned?           
+			  where FOLDERNO=?FOLDERNO?   ");
+
+:DECLARE arrInventoryIds;
+arrInventoryIds := SQLExecute("select distinct INVENTORYID
+							from BATCHSAMPLINGREQUIREMENT
+							where BATCHID = ?BATCHID?");
+:IF .NOT. Empty(arrInventoryIds);
+	arrInventoryIds := ExtractCol(arrInventoryIds, 1);
+:ENDIF;
+
+:DECLARE arrInvRet;
+arrInvRet := ExecFunction("BatchInventory.CreateBatchLoginTransaction", {arrInventoryIds, BATCHID});
+AAdd(arrInvRet, BATCHID);
+
+/* update SAMPDESC field value;
+ExecFunction("FieldContent.UpdateOrdersSampDesc", {"/MFG/RAW", "ORDERS.FOLDERNO = ?  and ORDERS.SAMPDESC is null", {FOLDERNO}});
+
+ExecFunction("BatchManager.executePlannedWFTriggers", {BATCHID});
+
+:IF bAutoStartBatch;
+	ExecFunction("Batchmanager.StartBatch", {BATCHID});
+:ENDIF;
+
+
+:RETURN arrInvRet;
